@@ -1,87 +1,40 @@
-import asyncio
-import json
-from dataclasses import dataclass
-from typing import Dict, List, Set
-import socket
-import time
+import numpy as np
+import tensorflow as tf
+from typing import List
 
-@dataclass
 class SwarmNode:
-    node_id: str
-    ip: str 
-    port: int
-    last_seen: float
-    capabilities: List[str]
+    def __init__(self, node_id: str, neighbors: List[str]):
+        self.node_id = node_id
+        self.neighbors = neighbors
+        self.model = self.build_model()
+        self.global_model = None
 
-class SwarmMesh:
-    def __init__(self, port: int = 5555):
-        self.port = port
-        self.nodes: Dict[str, SwarmNode] = {}
-        self.my_id = socket.gethostname()
-        self.my_capabilities = ['compute', 'storage']
-        
-    async def start(self):
-        """Start the mesh network node"""
-        self.broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.broadcast_socket.bind(('', self.port))
-        
-        await asyncio.gather(
-            self.broadcast_heartbeat(),
-            self.listen_for_nodes()
-        )
-    
-    async def broadcast_heartbeat(self):
-        """Periodically broadcast node presence"""
-        while True:
-            msg = {
-                'type': 'heartbeat',
-                'node_id': self.my_id,
-                'capabilities': self.my_capabilities,
-                'timestamp': time.time()
-            }
-            self.broadcast_socket.sendto(
-                json.dumps(msg).encode(),
-                ('<broadcast>', self.port)
-            )
-            await asyncio.sleep(5)
-    
-    async def listen_for_nodes(self):
-        """Listen for other nodes' heartbeats"""
-        while True:
-            data, addr = self.broadcast_socket.recvfrom(1024)
-            msg = json.loads(data.decode())
+    def build_model(self):
+        model = tf.keras.Sequential([
+            tf.keras.layers.Dense(64, activation='relu', input_shape=(100,)),
+            tf.keras.layers.Dense(32, activation='relu'),
+            tf.keras.layers.Dense(10, activation='softmax')
+        ])
+        model.compile(optimizer='adam',
+                      loss='categorical_crossentropy',
+                      metrics=['accuracy'])
+        return model
+
+    def train_local_model(self, X, y):
+        self.model.fit(X, y, epochs=5, batch_size=32)
+
+    def aggregate_global_model(self):
+        if self.global_model is None:
+            self.global_model = self.model.get_weights()
+        else:
+            local_weights = self.model.get_weights()
+            global_weights = self.global_model
             
-            if msg['type'] == 'heartbeat':
-                node = SwarmNode(
-                    node_id=msg['node_id'],
-                    ip=addr[0],
-                    port=addr[1], 
-                    last_seen=msg['timestamp'],
-                    capabilities=msg['capabilities']
-                )
-                self.nodes[node.node_id] = node
-                
-            # Cleanup stale nodes
-            self._cleanup_nodes()
-    
-    def _cleanup_nodes(self, max_age: float = 15.0):
-        """Remove nodes that haven't been seen recently"""
-        now = time.time()
-        stale = []
-        for node_id, node in self.nodes.items():
-            if now - node.last_seen > max_age:
-                stale.append(node_id)
-        for node_id in stale:
-            del self.nodes[node_id]
-    
-    def get_nodes_with_capability(self, capability: str) -> List[SwarmNode]:
-        """Find nodes that have a specific capability"""
-        return [
-            node for node in self.nodes.values()
-            if capability in node.capabilities
-        ]
+            # Federated averaging
+            aggregated_weights = [np.average([lw, gw], axis=0, weights=[1, len(self.neighbors)]) 
+                                  for lw, gw in zip(local_weights, global_weights)]
+            
+            self.global_model = aggregated_weights
 
-if __name__ == '__main__':
-    mesh = SwarmMesh()
-    asyncio.run(mesh.start())
+    def update_local_model(self):
+        self.model.set_weights(self.global_model)
