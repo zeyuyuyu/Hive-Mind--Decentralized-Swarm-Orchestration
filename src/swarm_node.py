@@ -1,129 +1,98 @@
 import asyncio
 import json
-import logging
 from dataclasses import dataclass
-from typing import Dict, Set
+from typing import List, Set
+import websockets
 
 @dataclass
-class NodeInfo:
-    node_id: str
-    ip: str
-    port: int
-    last_seen: float
-    capabilities: Set[str]
-
 class SwarmNode:
-    def __init__(self, node_id: str, port: int):
-        self.node_id = node_id
-        self.port = port
-        self.peers: Dict[str, NodeInfo] = {}
-        self.capabilities = set(['compute', 'storage'])
-        self.logger = logging.getLogger('SwarmNode')
+    node_id: str
+    peers: Set[str]
+    ws_port: int
+    is_alive: bool = True
 
     async def start(self):
-        self.server = await asyncio.start_server(
-            self.handle_connection, '0.0.0.0', self.port)
-        self.discovery_task = asyncio.create_task(self.periodic_discovery())
-        self.cleanup_task = asyncio.create_task(self.periodic_cleanup())
-        self.logger.info(f'Node {self.node_id} listening on port {self.port}')
-
-    async def stop(self):
-        self.discovery_task.cancel()
-        self.cleanup_task.cancel()
-        self.server.close()
+        self.server = await websockets.serve(
+            self.handle_connection,
+            'localhost',
+            self.ws_port
+        )
+        await self.discover_peers()
         await self.server.wait_closed()
 
-    async def handle_connection(self, reader, writer):
+    async def handle_connection(self, websocket, path):
         try:
-            data = await reader.read(1024)
-            message = json.loads(data.decode())
-            
-            if message['type'] == 'discovery':
-                await self.handle_discovery(message, writer)
-            elif message['type'] == 'task':
-                await self.handle_task(message, writer)
+            async for message in websocket:
+                data = json.loads(message)
+                if data['type'] == 'discovery':
+                    await self.handle_discovery(websocket, data)
+                elif data['type'] == 'task':
+                    await self.handle_task(websocket, data)
+        except websockets.exceptions.ConnectionClosed:
+            pass
 
-            writer.close()
-            await writer.wait_closed()
+    async def handle_discovery(self, websocket, data):
+        peer_id = data['node_id']
+        if peer_id not in self.peers:
+            self.peers.add(peer_id)
+            # Broadcast new peer to all connected nodes
+            await self.broadcast_peer(peer_id)
+        
+        # Send back our known peers
+        await websocket.send(json.dumps({
+            'type': 'peers',
+            'peers': list(self.peers)
+        }))
 
-        except Exception as e:
-            self.logger.error(f'Error handling connection: {e}')
+    async def handle_task(self, websocket, data):
+        # Process incoming task
+        result = await self.execute_task(data['payload'])
+        await websocket.send(json.dumps({
+            'type': 'result',
+            'task_id': data['task_id'],
+            'result': result
+        }))
 
-    async def handle_discovery(self, message, writer):
-        peer_info = NodeInfo(
-            node_id=message['node_id'],
-            ip=message['ip'],
-            port=message['port'],
-            last_seen=asyncio.get_event_loop().time(),
-            capabilities=set(message['capabilities'])
-        )
-        self.peers[peer_info.node_id] = peer_info
-
-        # Reply with our info
-        response = {
-            'type': 'discovery_reply',
-            'node_id': self.node_id,
-            'capabilities': list(self.capabilities)
-        }
-        writer.write(json.dumps(response).encode())
-        await writer.drain()
-
-    async def periodic_discovery(self):
-        while True:
-            try:
-                # Broadcast discovery to known peers
-                for peer in self.peers.values():
-                    try:
-                        reader, writer = await asyncio.open_connection(
-                            peer.ip, peer.port)
-                        
-                        message = {
+    async def discover_peers(self):
+        # Try connecting to potential peers on nearby ports
+        base_port = 8000
+        for port in range(base_port, base_port + 10):
+            if port != self.ws_port:
+                try:
+                    uri = f'ws://localhost:{port}'
+                    async with websockets.connect(uri) as websocket:
+                        await websocket.send(json.dumps({
                             'type': 'discovery',
-                            'node_id': self.node_id,
-                            'ip': '0.0.0.0',  # Replace with actual IP
-                            'port': self.port,
-                            'capabilities': list(self.capabilities)
-                        }
-                        
-                        writer.write(json.dumps(message).encode())
-                        await writer.drain()
-                        
-                        data = await reader.read(1024)
-                        response = json.loads(data.decode())
-                        
-                        if response['type'] == 'discovery_reply':
-                            peer.last_seen = asyncio.get_event_loop().time()
-                            peer.capabilities = set(response['capabilities'])
-                        
-                        writer.close()
-                        await writer.wait_closed()
-                        
-                    except Exception as e:
-                        self.logger.warning(f'Failed to contact peer {peer.node_id}: {e}')
-                        
-            except Exception as e:
-                self.logger.error(f'Error in discovery: {e}')
-                
-            await asyncio.sleep(60)  # Run discovery every minute
+                            'node_id': self.node_id
+                        }))
+                        response = await websocket.recv()
+                        peers_data = json.loads(response)
+                        self.peers.update(peers_data['peers'])
+                except:
+                    continue
 
-    async def periodic_cleanup(self):
-        while True:
+    async def broadcast_peer(self, new_peer_id):
+        # Notify all peers about new node
+        for peer in self.peers:
             try:
-                current_time = asyncio.get_event_loop().time()
-                expired_peers = [
-                    node_id for node_id, peer in self.peers.items()
-                    if current_time - peer.last_seen > 180  # 3 minutes timeout
-                ]
-                
-                for node_id in expired_peers:
-                    del self.peers[node_id]
-                    self.logger.info(f'Removed inactive peer {node_id}')
-                    
-            except Exception as e:
-                self.logger.error(f'Error in cleanup: {e}')
-                
-            await asyncio.sleep(60)
+                uri = f'ws://localhost:{self.get_port_for_peer(peer)}'
+                async with websockets.connect(uri) as websocket:
+                    await websocket.send(json.dumps({
+                        'type': 'new_peer',
+                        'node_id': new_peer_id
+                    }))
+            except:
+                continue
 
-    async def handle_task(self, message, writer):
-        # Task handling implementation
-        pass
+    async def execute_task(self, payload):
+        # Implement task execution logic here
+        return {'status': 'completed', 'data': payload}
+
+    def get_port_for_peer(self, peer_id):
+        # Simple hash function to determine peer's port
+        return 8000 + hash(peer_id) % 10
+
+    async def shutdown(self):
+        self.is_alive = False
+        self.server.close()
+        await self.server.wait_closed()
