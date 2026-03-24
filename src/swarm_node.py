@@ -1,98 +1,50 @@
-import asyncio
-import json
-from dataclasses import dataclass
-from typing import List, Set
-import websockets
+import os
+import time
+import psutil
+import requests
 
-@dataclass
 class SwarmNode:
-    node_id: str
-    peers: Set[str]
-    ws_port: int
-    is_alive: bool = True
+    def __init__(self, node_id, swarm_manager_url):
+        self.node_id = node_id
+        self.swarm_manager_url = swarm_manager_url
+        self.min_cpu_utilization = 20
+        self.max_cpu_utilization = 80
+        self.min_memory_utilization = 20
+        self.max_memory_utilization = 80
 
-    async def start(self):
-        self.server = await websockets.serve(
-            self.handle_connection,
-            'localhost',
-            self.ws_port
-        )
-        await self.discover_peers()
-        await self.server.wait_closed()
+    def monitor_resources(self):
+        cpu_utilization = psutil.cpu_percent(interval=1)
+        memory_utilization = psutil.virtual_memory().percent
 
-    async def handle_connection(self, websocket, path):
-        try:
-            async for message in websocket:
-                data = json.loads(message)
-                if data['type'] == 'discovery':
-                    await self.handle_discovery(websocket, data)
-                elif data['type'] == 'task':
-                    await self.handle_task(websocket, data)
-        except websockets.exceptions.ConnectionClosed:
-            pass
+        if cpu_utilization < self.min_cpu_utilization or cpu_utilization > self.max_cpu_utilization or \
+           memory_utilization < self.min_memory_utilization or memory_utilization > self.max_memory_utilization:
+            self.scale_swarm()
 
-    async def handle_discovery(self, websocket, data):
-        peer_id = data['node_id']
-        if peer_id not in self.peers:
-            self.peers.add(peer_id)
-            # Broadcast new peer to all connected nodes
-            await self.broadcast_peer(peer_id)
-        
-        # Send back our known peers
-        await websocket.send(json.dumps({
-            'type': 'peers',
-            'peers': list(self.peers)
-        }))
+    def scale_swarm(self):
+        current_nodes = self._get_current_nodes()
+        if cpu_utilization < self.min_cpu_utilization or memory_utilization < self.min_memory_utilization:
+            self._add_node()
+        elif cpu_utilization > self.max_cpu_utilization or memory_utilization > self.max_memory_utilization:
+            self._remove_node(current_nodes)
 
-    async def handle_task(self, websocket, data):
-        # Process incoming task
-        result = await self.execute_task(data['payload'])
-        await websocket.send(json.dumps({
-            'type': 'result',
-            'task_id': data['task_id'],
-            'result': result
-        }))
+    def _get_current_nodes(self):
+        response = requests.get(f'{self.swarm_manager_url}/nodes')
+        return response.json()
 
-    async def discover_peers(self):
-        # Try connecting to potential peers on nearby ports
-        base_port = 8000
-        for port in range(base_port, base_port + 10):
-            if port != self.ws_port:
-                try:
-                    uri = f'ws://localhost:{port}'
-                    async with websockets.connect(uri) as websocket:
-                        await websocket.send(json.dumps({
-                            'type': 'discovery',
-                            'node_id': self.node_id
-                        }))
-                        response = await websocket.recv()
-                        peers_data = json.loads(response)
-                        self.peers.update(peers_data['peers'])
-                except:
-                    continue
+    def _add_node(self):
+        response = requests.post(f'{self.swarm_manager_url}/nodes')
+        if response.status_code == 200:
+            print(f'Added new node to the swarm.')
+        else:
+            print(f'Failed to add new node to the swarm.')
 
-    async def broadcast_peer(self, new_peer_id):
-        # Notify all peers about new node
-        for peer in self.peers:
-            try:
-                uri = f'ws://localhost:{self.get_port_for_peer(peer)}'
-                async with websockets.connect(uri) as websocket:
-                    await websocket.send(json.dumps({
-                        'type': 'new_peer',
-                        'node_id': new_peer_id
-                    }))
-            except:
-                continue
-
-    async def execute_task(self, payload):
-        # Implement task execution logic here
-        return {'status': 'completed', 'data': payload}
-
-    def get_port_for_peer(self, peer_id):
-        # Simple hash function to determine peer's port
-        return 8000 + hash(peer_id) % 10
-
-    async def shutdown(self):
-        self.is_alive = False
-        self.server.close()
-        await self.server.wait_closed()
+    def _remove_node(self, current_nodes):
+        if len(current_nodes) > 1:
+            node_to_remove = current_nodes[-1]
+            response = requests.delete(f'{self.swarm_manager_url}/nodes/{node_to_remove["ID"]}')
+            if response.status_code == 200:
+                print(f'Removed node {node_to_remove["ID"]} from the swarm.')
+            else:
+                print(f'Failed to remove node {node_to_remove["ID"]} from the swarm.')
+        else:
+            print(f'Cannot remove the last node from the swarm.')
