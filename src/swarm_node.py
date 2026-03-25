@@ -1,50 +1,120 @@
-import os
-import time
-import psutil
-import requests
+import asyncio
+import json
+from typing import Dict, Set
+from dataclasses import dataclass
+import logging
+
+@dataclass
+class NodeInfo:
+    node_id: str
+    address: str
+    port: int
+    capabilities: Set[str]
+    last_seen: float
 
 class SwarmNode:
-    def __init__(self, node_id, swarm_manager_url):
+    def __init__(self, node_id: str, port: int):
         self.node_id = node_id
-        self.swarm_manager_url = swarm_manager_url
-        self.min_cpu_utilization = 20
-        self.max_cpu_utilization = 80
-        self.min_memory_utilization = 20
-        self.max_memory_utilization = 80
+        self.port = port
+        self.peers: Dict[str, NodeInfo] = {}
+        self.capabilities = set(['compute', 'storage'])
+        self.logger = logging.getLogger('SwarmNode')
+        
+    async def start(self):
+        """Start the swarm node and begin peer discovery"""
+        self.server = await asyncio.start_server(
+            self._handle_connection, '0.0.0.0', self.port)
+        self.logger.info(f'Node {self.node_id} listening on port {self.port}')
+        asyncio.create_task(self._periodic_heartbeat())
+        asyncio.create_task(self._cleanup_stale_peers())
 
-    def monitor_resources(self):
-        cpu_utilization = psutil.cpu_percent(interval=1)
-        memory_utilization = psutil.virtual_memory().percent
+    async def _handle_connection(self, reader, writer):
+        """Handle incoming peer connections"""
+        data = await reader.read(1024)
+        msg = json.loads(data.decode())
+        
+        if msg['type'] == 'discovery':
+            # Register new peer
+            peer_info = NodeInfo(
+                node_id=msg['node_id'],
+                address=writer.get_extra_info('peername')[0],
+                port=msg['port'],
+                capabilities=set(msg['capabilities']),
+                last_seen=asyncio.get_event_loop().time()
+            )
+            self.peers[msg['node_id']] = peer_info
+            
+            # Send response with our info
+            response = {
+                'type': 'discovery_response',
+                'node_id': self.node_id,
+                'port': self.port,
+                'capabilities': list(self.capabilities)
+            }
+            writer.write(json.dumps(response).encode())
+            await writer.drain()
+            
+        elif msg['type'] == 'heartbeat':
+            if msg['node_id'] in self.peers:
+                self.peers[msg['node_id']].last_seen = \\
+                    asyncio.get_event_loop().time()
+                
+        writer.close()
+        await writer.wait_closed()
 
-        if cpu_utilization < self.min_cpu_utilization or cpu_utilization > self.max_cpu_utilization or \
-           memory_utilization < self.min_memory_utilization or memory_utilization > self.max_memory_utilization:
-            self.scale_swarm()
+    async def _periodic_heartbeat(self):
+        """Periodically send heartbeat to all known peers"""
+        while True:
+            for peer in self.peers.values():
+                try:
+                    reader, writer = await asyncio.open_connection(
+                        peer.address, peer.port)
+                    
+                    msg = {
+                        'type': 'heartbeat',
+                        'node_id': self.node_id
+                    }
+                    writer.write(json.dumps(msg).encode())
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                    
+                except Exception as e:
+                    self.logger.warning(
+                        f'Failed to send heartbeat to {peer.node_id}: {e}')
+                    
+            await asyncio.sleep(5)
 
-    def scale_swarm(self):
-        current_nodes = self._get_current_nodes()
-        if cpu_utilization < self.min_cpu_utilization or memory_utilization < self.min_memory_utilization:
-            self._add_node()
-        elif cpu_utilization > self.max_cpu_utilization or memory_utilization > self.max_memory_utilization:
-            self._remove_node(current_nodes)
+    async def _cleanup_stale_peers(self):
+        """Remove peers that haven't been seen recently"""
+        while True:
+            current_time = asyncio.get_event_loop().time()
+            stale_peers = [
+                node_id for node_id, info in self.peers.items()
+                if current_time - info.last_seen > 15
+            ]
+            
+            for node_id in stale_peers:
+                self.logger.info(f'Removing stale peer {node_id}')
+                del self.peers[node_id]
+                
+            await asyncio.sleep(5)
 
-    def _get_current_nodes(self):
-        response = requests.get(f'{self.swarm_manager_url}/nodes')
-        return response.json()
+    async def broadcast_to_peers(self, message: dict):
+        """Send a message to all connected peers"""
+        for peer in self.peers.values():
+            try:
+                reader, writer = await asyncio.open_connection(
+                    peer.address, peer.port)
+                writer.write(json.dumps(message).encode())
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+            except Exception as e:
+                self.logger.error(
+                    f'Failed to broadcast to {peer.node_id}: {e}')
 
-    def _add_node(self):
-        response = requests.post(f'{self.swarm_manager_url}/nodes')
-        if response.status_code == 200:
-            print(f'Added new node to the swarm.')
-        else:
-            print(f'Failed to add new node to the swarm.')
-
-    def _remove_node(self, current_nodes):
-        if len(current_nodes) > 1:
-            node_to_remove = current_nodes[-1]
-            response = requests.delete(f'{self.swarm_manager_url}/nodes/{node_to_remove["ID"]}')
-            if response.status_code == 200:
-                print(f'Removed node {node_to_remove["ID"]} from the swarm.')
-            else:
-                print(f'Failed to remove node {node_to_remove["ID"]} from the swarm.')
-        else:
-            print(f'Cannot remove the last node from the swarm.')
+    def get_peers_with_capability(self, capability: str) -> Set[str]:
+        """Find all peers that have a specific capability"""
+        return {node_id for node_id, info in self.peers.items() 
+                if capability in info.capabilities}
